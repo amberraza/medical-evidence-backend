@@ -55,11 +55,29 @@ app.post('/api/search-pubmed', async (req, res) => {
       return res.status(400).json({ error: 'Query parameter is required' });
     }
 
-    console.log('Searching PubMed for:', query);
-    console.log('With filters:', filters);
+    console.log('Original query:', query, '(length:', query.length, 'chars)');
+
+    // Truncate very long queries to avoid URL length issues with PubMed GET requests
+    // PubMed URLs have a ~2000 character limit, and we need room for filters too
+    let searchQuery = query;
+    const MAX_QUERY_LENGTH = 300;
+
+    if (searchQuery.length > MAX_QUERY_LENGTH) {
+      console.warn('Query too long, truncating from', searchQuery.length, 'to', MAX_QUERY_LENGTH, 'chars');
+      // Try to truncate at a word boundary
+      searchQuery = searchQuery.substring(0, MAX_QUERY_LENGTH);
+      const lastSpace = searchQuery.lastIndexOf(' ');
+      if (lastSpace > MAX_QUERY_LENGTH * 0.8) { // Only trim to word if we're not losing too much
+        searchQuery = searchQuery.substring(0, lastSpace);
+      }
+      searchQuery = searchQuery.trim();
+      console.log('Truncated query:', searchQuery);
+    }
+
+    console.log('Searching PubMed with filters:', filters);
 
     // Build filtered query
-    let searchTerm = query;
+    let searchTerm = searchQuery;
 
     // Add date range filter
     if (filters?.dateRange && filters.dateRange !== 'all') {
@@ -243,6 +261,12 @@ app.post('/api/search-pubmed', async (req, res) => {
 
   } catch (error) {
     console.error('PubMed search error:', error.message);
+    console.error('Error details:', {
+      code: error.code,
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: error.response?.data
+    });
 
     // Determine error type and provide helpful message
     let statusCode = 500;
@@ -261,6 +285,10 @@ app.post('/api/search-pubmed', async (req, res) => {
     } else if (error.response?.status >= 500) {
       errorMessage = 'PubMed service is temporarily unavailable. Please try again later.';
       statusCode = 503;
+    } else if (error.response?.status === 414) {
+      errorMessage = 'Search query is too long. Please use a shorter question.';
+      statusCode = 400;
+      retryable = false;
     } else if (error.response?.status >= 400 && error.response?.status < 500) {
       errorMessage = 'Invalid search query. Please check your search terms.';
       statusCode = 400;
@@ -344,7 +372,7 @@ FOLLOW-UP QUESTIONS:
         'https://api.anthropic.com/v1/messages',
         {
           model: 'claude-sonnet-4-5-20250929',
-          max_tokens: 2000,
+          max_tokens: 4096,
           system: systemPrompt,
           messages: messages
         },
@@ -362,25 +390,39 @@ FOLLOW-UP QUESTIONS:
 
     const aiResponse = response.data.content[0].text;
     console.log('Generated response successfully');
+    console.log('Response length:', aiResponse.length, 'characters');
 
     // Extract follow-up questions from response
     let mainResponse = aiResponse;
     let followUpQuestions = [];
 
-    const followUpMatch = aiResponse.match(/FOLLOW-UP QUESTIONS:\s*([\s\S]*)/i);
-    if (followUpMatch) {
-      // Split main response and follow-ups
-      mainResponse = aiResponse.split(/FOLLOW-UP QUESTIONS:/i)[0].trim();
+    try {
+      const followUpMatch = aiResponse.match(/FOLLOW-UP QUESTIONS:\s*([\s\S]*)/i);
+      if (followUpMatch) {
+        // Split main response and follow-ups
+        mainResponse = aiResponse.split(/FOLLOW-UP QUESTIONS:/i)[0].trim();
 
-      // Extract questions (numbered list format)
-      const questionsText = followUpMatch[1];
-      const questionMatches = questionsText.match(/\d+\.\s*(.+?)(?=\d+\.|$)/gs);
+        // Extract questions (numbered list format)
+        const questionsText = followUpMatch[1];
+        const questionLines = questionsText.split('\n')
+          .map(line => line.trim())
+          .filter(line => /^\d+\.\s*.+/.test(line));
 
-      if (questionMatches) {
-        followUpQuestions = questionMatches.map(q =>
-          q.replace(/^\d+\.\s*/, '').trim()
-        ).filter(q => q.length > 0);
+        followUpQuestions = questionLines.map(line =>
+          line.replace(/^\d+\.\s*/, '').trim()
+        ).filter(q => q.length > 0 && q.length < 300); // Limit question length
+
+        console.log('Extracted', followUpQuestions.length, 'follow-up questions');
       }
+    } catch (parseError) {
+      console.warn('Failed to parse follow-up questions:', parseError.message);
+      // Continue without follow-up questions if parsing fails
+    }
+
+    // Log usage stats for debugging
+    const usage = response.data.usage;
+    if (usage) {
+      console.log('Token usage - Input:', usage.input_tokens, 'Output:', usage.output_tokens);
     }
 
     res.json({
