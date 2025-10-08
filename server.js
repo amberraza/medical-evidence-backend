@@ -76,8 +76,8 @@ app.post('/api/search-pubmed', async (req, res) => {
 
     console.log('Searching PubMed with filters:', filters);
 
-    // Use the query directly - PubMed handles natural language reasonably well
-    // We can add keyword extraction later if needed as an optimization
+    // Use query as-is - PubMed's ranking algorithm is already good
+    // We'll do relevance scoring on the client side
     let searchTerm = searchQuery;
 
     // Add date range filter
@@ -298,6 +298,176 @@ app.post('/api/search-pubmed', async (req, res) => {
   }
 });
 
+// Search Europe PMC endpoint
+app.post('/api/search-europepmc', async (req, res) => {
+  try {
+    const { query, filters } = req.body;
+
+    if (!query) {
+      return res.status(400).json({ error: 'Query parameter is required' });
+    }
+
+    console.log('Searching Europe PMC with query:', query);
+
+    // Improve query construction - wrap main query in title/abstract search
+    // Europe PMC syntax: (query) to search in title and abstract
+    let searchQuery = `(${query})`;
+
+    // Add filters to Europe PMC query
+    let filterParams = '';
+
+    // Add date range filter
+    if (filters?.dateRange && filters.dateRange !== 'all') {
+      const currentYear = new Date().getFullYear();
+      const yearsAgo = {
+        '1year': 1,
+        '5years': 5,
+        '10years': 10
+      };
+      const startYear = currentYear - (yearsAgo[filters.dateRange] || 0);
+      filterParams += ` AND (FIRST_PDATE:[${startYear} TO ${currentYear}])`;
+    }
+
+    // Add study type filter
+    if (filters?.studyType && filters.studyType !== 'all') {
+      const studyTypeFilters = {
+        'rct': 'randomized controlled trial',
+        'meta': 'meta-analysis',
+        'review': 'review OR systematic review',
+        'clinical': 'clinical trial',
+        'guideline': 'guideline'
+      };
+      if (studyTypeFilters[filters.studyType]) {
+        filterParams += ` AND (${studyTypeFilters[filters.studyType]})`;
+      }
+    }
+
+    const finalQuery = searchQuery + filterParams;
+    console.log('Final Europe PMC query:', finalQuery);
+
+    // Search Europe PMC
+    const searchUrl = 'https://www.ebi.ac.uk/europepmc/webservices/rest/search';
+    const searchParams = {
+      query: finalQuery,
+      format: 'json',
+      pageSize: 20,
+      resultType: 'core',
+      sort: 'relevance'
+    };
+
+    const response = await retryWithBackoff(
+      () => axios.get(searchUrl, { params: searchParams }),
+      3,
+      1000
+    );
+
+    const results = response.data.resultList?.result || [];
+
+    if (results.length === 0) {
+      return res.json({ articles: [] });
+    }
+
+    console.log('Found', results.length, 'articles from Europe PMC');
+
+    // Helper function to extract year
+    const extractYear = (dateStr) => {
+      if (!dateStr) return null;
+      const yearMatch = dateStr.match(/\d{4}/);
+      return yearMatch ? parseInt(yearMatch[0]) : null;
+    };
+
+    // Helper function to determine if article is recent
+    const isRecent = (year) => {
+      if (!year) return false;
+      const currentYear = new Date().getFullYear();
+      return (currentYear - year) <= 1;
+    };
+
+    // Helper function to map Europe PMC pub types to our categories
+    const getStudyType = (pubTypeList) => {
+      if (!pubTypeList || pubTypeList.length === 0) return null;
+
+      const types = pubTypeList.map(t => t.toLowerCase());
+
+      if (types.some(t => t.includes('meta-analysis'))) return 'Meta-Analysis';
+      if (types.some(t => t.includes('systematic review'))) return 'Systematic Review';
+      if (types.some(t => t.includes('randomized controlled trial'))) return 'RCT';
+      if (types.some(t => t.includes('clinical trial'))) return 'Clinical Trial';
+      if (types.some(t => t.includes('review'))) return 'Review';
+      if (types.some(t => t.includes('guideline'))) return 'Guideline';
+
+      return 'Research Article';
+    };
+
+    // Parse articles
+    const articles = results.map(article => {
+      const pubYear = extractYear(article.firstPublicationDate || article.pubYear);
+      const studyType = getStudyType(article.pubTypeList?.pubType || []);
+
+      // Build URL based on source
+      let url = '';
+      if (article.pmid) {
+        url = `https://pubmed.ncbi.nlm.nih.gov/${article.pmid}/`;
+      } else if (article.pmcid) {
+        url = `https://europepmc.org/article/PMC/${article.pmcid.replace('PMC', '')}`;
+      } else if (article.doi) {
+        url = `https://doi.org/${article.doi}`;
+      } else {
+        url = `https://europepmc.org/article/${article.source}/${article.id}`;
+      }
+
+      return {
+        pmid: article.pmid || article.id,
+        title: article.title || 'No title available',
+        authors: article.authorString || article.authorList?.author?.slice(0, 3).map(a => `${a.firstName || ''} ${a.lastName || ''}`.trim()).join(', ') || 'Unknown authors',
+        allAuthors: article.authorString || 'Unknown authors',
+        journal: article.journalTitle || article.journalInfo?.journal?.title || 'Unknown journal',
+        pubdate: article.firstPublicationDate || article.pubYear || 'Unknown date',
+        url: url,
+        studyType: studyType,
+        publicationYear: pubYear,
+        isRecent: isRecent(pubYear),
+        publicationTypes: article.pubTypeList?.pubType || [],
+        abstract: article.abstractText || null,
+        doi: article.doi || null,
+        source: 'Europe PMC',
+        hasFullText: article.isOpenAccess === 'Y' || article.inEPMC === 'Y'
+      };
+    }).filter(Boolean);
+
+    console.log('Returning', articles.length, 'articles from Europe PMC');
+
+    res.json({ articles });
+
+  } catch (error) {
+    console.error('Europe PMC search error:', error.message);
+
+    let statusCode = 500;
+    let errorMessage = 'Failed to search Europe PMC';
+    let retryable = true;
+
+    if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+      errorMessage = 'Europe PMC request timed out. Please try again.';
+      statusCode = 504;
+    } else if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
+      errorMessage = 'Unable to connect to Europe PMC. Please check your internet connection.';
+      statusCode = 503;
+    } else if (error.response?.status === 429) {
+      errorMessage = 'Europe PMC rate limit exceeded. Please wait a moment and try again.';
+      statusCode = 429;
+    } else if (error.response?.status >= 500) {
+      errorMessage = 'Europe PMC service is temporarily unavailable. Please try again later.';
+      statusCode = 503;
+    }
+
+    res.status(statusCode).json({
+      error: errorMessage,
+      details: error.message,
+      retryable: retryable
+    });
+  }
+});
+
 // Claude API endpoint with conversation history support
 app.post('/api/generate-response', async (req, res) => {
   try {
@@ -485,5 +655,6 @@ app.listen(PORT, () => {
   console.log(`🚀 Medical Evidence API server running on port ${PORT}`);
   console.log(`📍 Health check: http://localhost:${PORT}/api/health`);
   console.log(`🔍 PubMed search: POST http://localhost:${PORT}/api/search-pubmed`);
+  console.log(`🔬 Europe PMC search: POST http://localhost:${PORT}/api/search-europepmc`);
   console.log(`🤖 Claude generate: POST http://localhost:${PORT}/api/generate-response`);
 });
