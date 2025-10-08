@@ -76,51 +76,9 @@ app.post('/api/search-pubmed', async (req, res) => {
 
     console.log('Searching PubMed with filters:', filters);
 
-    // Extract medical keywords from natural language query using Claude
-    let searchTerm;
-    try {
-      console.log('Extracting medical keywords from query...');
-      const keywordResponse = await retryWithBackoff(
-        () => axios.post(
-          'https://api.anthropic.com/v1/messages',
-          {
-            model: 'claude-sonnet-4-5-20250929',
-            max_tokens: 200,
-            messages: [{
-              role: 'user',
-              content: `Extract the key medical search terms from this question for a PubMed search. Return ONLY the search terms separated by spaces, optimized for PubMed. Focus on: medical conditions, treatments, procedures, drugs, patient populations. Remove filler words.
-
-Question: "${searchQuery}"
-
-Search terms:`
-            }]
-          },
-          {
-            headers: {
-              'Content-Type': 'application/json',
-              'x-api-key': process.env.ANTHROPIC_API_KEY,
-              'anthropic-version': '2023-06-01'
-            }
-          }
-        ),
-        2,
-        1000
-      );
-
-      const extractedTerms = keywordResponse.data.content[0].text.trim();
-      console.log('Extracted search terms:', extractedTerms);
-
-      // Use extracted terms if they look valid (not empty, not too long)
-      if (extractedTerms && extractedTerms.length > 3 && extractedTerms.length < 200) {
-        searchTerm = extractedTerms;
-      } else {
-        console.warn('Invalid extracted terms, falling back to original query');
-        searchTerm = searchQuery;
-      }
-    } catch (keywordError) {
-      console.warn('Failed to extract keywords, using original query:', keywordError.message);
-      searchTerm = searchQuery;
-    }
+    // Use the query directly - PubMed handles natural language reasonably well
+    // We can add keyword extraction later if needed as an optimization
+    let searchTerm = searchQuery;
 
     // Add date range filter
     if (filters?.dateRange && filters.dateRange !== 'all') {
@@ -155,11 +113,9 @@ Search terms:`
     const searchParams = {
       db: 'pubmed',
       term: searchTerm,
-      retmax: 15, // Reduced from 20 for better quality
+      retmax: 20,
       retmode: 'json',
-      sort: 'relevance',
-      field: 'title,abstract', // Focus search on title and abstract for better relevance
-      usehistory: 'n'
+      sort: 'relevance'
     };
 
     const searchResponse = await retryWithBackoff(
@@ -306,12 +262,6 @@ Search terms:`
 
   } catch (error) {
     console.error('PubMed search error:', error.message);
-    console.error('Error details:', {
-      code: error.code,
-      status: error.response?.status,
-      statusText: error.response?.statusText,
-      data: error.response?.data
-    });
 
     // Determine error type and provide helpful message
     let statusCode = 500;
