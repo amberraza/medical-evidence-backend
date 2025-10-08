@@ -76,8 +76,51 @@ app.post('/api/search-pubmed', async (req, res) => {
 
     console.log('Searching PubMed with filters:', filters);
 
-    // Build filtered query
-    let searchTerm = searchQuery;
+    // Extract medical keywords from natural language query using Claude
+    let searchTerm;
+    try {
+      console.log('Extracting medical keywords from query...');
+      const keywordResponse = await retryWithBackoff(
+        () => axios.post(
+          'https://api.anthropic.com/v1/messages',
+          {
+            model: 'claude-sonnet-4-5-20250929',
+            max_tokens: 200,
+            messages: [{
+              role: 'user',
+              content: `Extract the key medical search terms from this question for a PubMed search. Return ONLY the search terms separated by spaces, optimized for PubMed. Focus on: medical conditions, treatments, procedures, drugs, patient populations. Remove filler words.
+
+Question: "${searchQuery}"
+
+Search terms:`
+            }]
+          },
+          {
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': process.env.ANTHROPIC_API_KEY,
+              'anthropic-version': '2023-06-01'
+            }
+          }
+        ),
+        2,
+        1000
+      );
+
+      const extractedTerms = keywordResponse.data.content[0].text.trim();
+      console.log('Extracted search terms:', extractedTerms);
+
+      // Use extracted terms if they look valid (not empty, not too long)
+      if (extractedTerms && extractedTerms.length > 3 && extractedTerms.length < 200) {
+        searchTerm = extractedTerms;
+      } else {
+        console.warn('Invalid extracted terms, falling back to original query');
+        searchTerm = searchQuery;
+      }
+    } catch (keywordError) {
+      console.warn('Failed to extract keywords, using original query:', keywordError.message);
+      searchTerm = searchQuery;
+    }
 
     // Add date range filter
     if (filters?.dateRange && filters.dateRange !== 'all') {
@@ -112,9 +155,11 @@ app.post('/api/search-pubmed', async (req, res) => {
     const searchParams = {
       db: 'pubmed',
       term: searchTerm,
-      retmax: 20,
+      retmax: 15, // Reduced from 20 for better quality
       retmode: 'json',
-      sort: 'relevance'
+      sort: 'relevance',
+      field: 'title,abstract', // Focus search on title and abstract for better relevance
+      usehistory: 'n'
     };
 
     const searchResponse = await retryWithBackoff(
@@ -315,23 +360,40 @@ app.post('/api/generate-response', async (req, res) => {
     console.log('Generating response for query:', query);
     console.log('Conversation history length:', conversationHistory?.length || 0);
 
-    // Format articles for the prompt
-    const articlesContext = articles.map((a, i) =>
-      `[${i + 1}] ${a.title}\n   Authors: ${a.authors}\n   Journal: ${a.journal}, ${a.pubdate}\n   PMID: ${a.pmid}\n   URL: ${a.url}`
-    ).join('\n\n');
+    // Format articles for the prompt - include abstracts for better context
+    const articlesContext = articles.map((a, i) => {
+      let context = `[${i + 1}] ${a.title}\n   Authors: ${a.authors}\n   Journal: ${a.journal}, ${a.pubdate}\n   PMID: ${a.pmid}`;
+      if (a.studyType) {
+        context += `\n   Study Type: ${a.studyType}`;
+      }
+      if (a.abstract) {
+        // Include abstract for context but truncate if too long
+        const abstractPreview = a.abstract.length > 500
+          ? a.abstract.substring(0, 500) + '...'
+          : a.abstract;
+        context += `\n   Abstract: ${abstractPreview}`;
+      }
+      return context;
+    }).join('\n\n');
 
     // Build system prompt
     const systemPrompt = `You are a medical information assistant that provides evidence-based answers. You help users explore medical topics through conversation, maintaining context from previous exchanges.
 
 When answering:
-1. Consider the conversation history to provide contextual responses
-2. Reference specific studies using [1], [2], etc. notation when making claims
-3. Be concise but thorough (2-4 paragraphs for initial questions, briefer for follow-ups)
-4. Include important caveats or limitations
-5. Use clear, professional language appropriate for healthcare contexts
-6. For follow-up questions, acknowledge previous context naturally
+1. CAREFULLY READ the abstracts provided - only cite sources that are actually relevant to the specific question
+2. If a source doesn't directly address the question, DO NOT cite it
+3. Consider the conversation history to provide contextual responses
+4. Reference specific studies using [1], [2], etc. notation ONLY when the study directly supports your claim
+5. Be concise but thorough (2-4 paragraphs for initial questions, briefer for follow-ups)
+6. Include important caveats or limitations found in the studies
+7. Use clear, professional language appropriate for healthcare contexts
+8. For follow-up questions, acknowledge previous context naturally
+9. If none of the provided sources are relevant, acknowledge this and provide general medical knowledge instead
 
-IMPORTANT: Do NOT reproduce or quote exact text from articles. Paraphrase and synthesize information in your own words while citing sources.`;
+IMPORTANT:
+- Do NOT cite sources just because they're provided - only cite what's actually relevant
+- Do NOT reproduce or quote exact text from articles. Paraphrase and synthesize information in your own words while citing sources.
+- Quality over quantity - it's better to cite 2-3 highly relevant sources than all sources provided`;
 
     // Build messages array with conversation history
     const messages = [];
