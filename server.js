@@ -1,10 +1,16 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const Anthropic = require('@anthropic-ai/sdk');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Initialize Anthropic client
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
 
 // Middleware
 app.use(cors());
@@ -650,6 +656,282 @@ FOLLOW-UP QUESTIONS:
   }
 });
 
+// Helper function to build PubMed query
+function buildPubMedQuery(query, filters) {
+  let searchTerm = query;
+
+  // Add date range filter
+  if (filters?.dateRange && filters.dateRange !== 'all') {
+    const dateFilters = {
+      '1year': '("2024/01/01"[Date - Publication] : "3000"[Date - Publication])',
+      '5years': '("2020/01/01"[Date - Publication] : "3000"[Date - Publication])',
+      '10years': '("2015/01/01"[Date - Publication] : "3000"[Date - Publication])',
+    };
+    if (dateFilters[filters.dateRange]) {
+      searchTerm += ' AND ' + dateFilters[filters.dateRange];
+    }
+  }
+
+  // Add study type filter
+  if (filters?.studyType && filters.studyType !== 'all') {
+    const studyTypeFilters = {
+      'meta-analysis': 'AND (Meta-Analysis[pt])',
+      'rct': 'AND (Randomized Controlled Trial[pt])',
+      'review': 'AND (Review[pt] OR Systematic Review[pt])',
+    };
+    if (studyTypeFilters[filters.studyType]) {
+      searchTerm += ' ' + studyTypeFilters[filters.studyType];
+    }
+  }
+
+  return searchTerm;
+}
+
+// Helper function to build Europe PMC query
+function buildEuropePMCQuery(query, filters) {
+  let searchQuery = `(${query})`;
+  let filterParams = '';
+
+  // Add date range filter
+  if (filters?.dateRange && filters.dateRange !== 'all') {
+    const currentYear = new Date().getFullYear();
+    const yearsAgo = { '1year': 1, '5years': 5, '10years': 10 };
+    const years = yearsAgo[filters.dateRange];
+    if (years) {
+      const startYear = currentYear - years;
+      filterParams += ` AND (FIRST_PDATE:[${startYear} TO ${currentYear}])`;
+    }
+  }
+
+  // Add study type filter
+  if (filters?.studyType && filters.studyType !== 'all') {
+    const studyTypeFilters = {
+      'meta-analysis': ' AND (PUB_TYPE:"Meta-Analysis")',
+      'rct': ' AND (PUB_TYPE:"Randomized Controlled Trial")',
+      'review': ' AND (PUB_TYPE:"Review" OR PUB_TYPE:"Systematic Review")',
+    };
+    if (studyTypeFilters[filters.studyType]) {
+      filterParams += studyTypeFilters[filters.studyType];
+    }
+  }
+
+  return searchQuery + filterParams;
+}
+
+// Helper function to perform multi-source search
+async function performSearch(query, filters) {
+  const searchPromises = [];
+
+  // Search PubMed
+  searchPromises.push(
+    (async () => {
+      try {
+        const pubmedQuery = buildPubMedQuery(query, filters);
+        const searchResponse = await retryWithBackoff(() =>
+          axios.get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi', {
+            params: {
+              db: 'pubmed',
+              term: pubmedQuery,
+              retmax: 20,
+              retmode: 'json',
+              sort: 'relevance'
+            }
+          })
+        );
+
+        const ids = searchResponse.data.esearchresult.idlist;
+        if (ids.length === 0) return [];
+
+        const summaryResponse = await retryWithBackoff(() =>
+          axios.get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi', {
+            params: {
+              db: 'pubmed',
+              id: ids.join(','),
+              retmode: 'json'
+            }
+          })
+        );
+
+        return Object.values(summaryResponse.data.result).filter(item => item.uid).map(article => ({
+          pmid: article.uid,
+          title: article.title || 'No title',
+          authors: article.authors?.map(a => a.name).join(', ') || 'Unknown',
+          journal: article.fulljournalname || article.source || 'Unknown',
+          year: article.pubdate?.split(' ')[0] || 'Unknown',
+          doi: article.elocationid || null,
+          abstract: null,
+          source: 'PubMed'
+        }));
+      } catch (err) {
+        console.warn('PubMed search failed:', err.message);
+        return [];
+      }
+    })()
+  );
+
+  // Search Europe PMC
+  searchPromises.push(
+    (async () => {
+      try {
+        const europePmcQuery = buildEuropePMCQuery(query, filters);
+        const response = await retryWithBackoff(() =>
+          axios.get('https://www.ebi.ac.uk/europepmc/webservices/rest/search', {
+            params: {
+              query: europePmcQuery,
+              format: 'json',
+              pageSize: 20,
+              resultType: 'core',
+              sort: 'relevance'
+            }
+          })
+        );
+
+        return (response.data.resultList?.result || []).map(article => ({
+          pmid: article.pmid || null,
+          title: article.title || 'No title',
+          authors: article.authorString || 'Unknown',
+          journal: article.journalTitle || 'Unknown',
+          year: article.pubYear || 'Unknown',
+          doi: article.doi || null,
+          abstract: article.abstractText || null,
+          source: 'Europe PMC'
+        }));
+      } catch (err) {
+        console.warn('Europe PMC search failed:', err.message);
+        return [];
+      }
+    })()
+  );
+
+  const results = await Promise.all(searchPromises);
+  const allArticles = results.flat();
+
+  // Deduplicate by PMID or title
+  const seen = new Set();
+  return allArticles.filter(article => {
+    const key = article.pmid || article.title.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+// Deep Research endpoint
+app.post('/api/deep-research', async (req, res) => {
+  try {
+    const { query, filters } = req.body;
+
+    if (!query) {
+      return res.status(400).json({ error: 'Query is required' });
+    }
+
+    console.log('🔬 Deep research request:', query);
+
+    // Stage 1: Initial search
+    const initialArticles = await performSearch(query, filters);
+
+    if (initialArticles.length === 0) {
+      return res.status(404).json({
+        error: 'No relevant articles found',
+        retryable: true
+      });
+    }
+
+    // Stage 2: Analyze results and generate follow-up questions
+    const analysisPrompt = `You are a medical research expert. Analyze these research findings and:
+1. Identify 3-5 specific follow-up questions that would provide deeper insight
+2. Focus on: mechanisms, clinical outcomes, populations not covered, contradictions, recent advances
+
+Original question: ${query}
+
+Research findings:
+${initialArticles.slice(0, 10).map(a => `- ${a.title} (${a.year}): ${a.abstract?.substring(0, 200)}...`).join('\n')}
+
+Generate ONLY a JSON array of 3-5 follow-up question strings. No other text.
+Example format: ["question 1", "question 2", "question 3"]`;
+
+    const analysisResponse = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      temperature: 0.7,
+      messages: [{
+        role: 'user',
+        content: analysisPrompt
+      }]
+    });
+
+    let followUpQuestions;
+    try {
+      const responseText = analysisResponse.content[0].text.trim();
+      const jsonMatch = responseText.match(/\[[\s\S]*\]/);
+      followUpQuestions = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+    } catch (e) {
+      console.error('Failed to parse follow-up questions:', e);
+      followUpQuestions = [];
+    }
+
+    // Stage 3: Search for each follow-up question
+    const followUpResults = [];
+    for (const fq of followUpQuestions.slice(0, 5)) {
+      const articles = await performSearch(fq, filters);
+      followUpResults.push({
+        question: fq,
+        articles: articles.slice(0, 5)
+      });
+    }
+
+    // Stage 4: Generate comprehensive synthesis
+    const synthesisPrompt = `Create a comprehensive medical research report.
+
+ORIGINAL QUESTION: ${query}
+
+INITIAL FINDINGS (${initialArticles.length} articles):
+${initialArticles.slice(0, 10).map(a => `- ${a.title} (${a.year}, ${a.journal})`).join('\n')}
+
+FOLLOW-UP RESEARCH:
+${followUpResults.map(fr => `\n${fr.question}\n${fr.articles.map(a => `  - ${a.title} (${a.year})`).join('\n')}`).join('\n')}
+
+Provide a detailed synthesis covering:
+1. Key Findings (main takeaways)
+2. Clinical Implications (practical applications)
+3. Evidence Quality (strength of research)
+4. Knowledge Gaps (what's still unknown)
+5. Recommendations (evidence-based guidance)
+
+Format in clear markdown with headers.`;
+
+    const synthesisResponse = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 3000,
+      temperature: 0.7,
+      messages: [{
+        role: 'user',
+        content: synthesisPrompt
+      }]
+    });
+
+    res.json({
+      synthesis: synthesisResponse.content[0].text,
+      initialArticles: initialArticles.slice(0, 20),
+      followUpQuestions,
+      followUpResults: followUpResults.map(fr => ({
+        question: fr.question,
+        articleCount: fr.articles.length,
+        topArticles: fr.articles.slice(0, 3)
+      })),
+      totalArticlesAnalyzed: initialArticles.length + followUpResults.reduce((sum, fr) => sum + fr.articles.length, 0)
+    });
+
+  } catch (error) {
+    console.error('Deep research error:', error);
+    res.status(500).json({
+      error: 'Failed to complete deep research',
+      details: error.message,
+      retryable: true
+    });
+  }
+});
+
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Medical Evidence API server running on port ${PORT}`);
@@ -657,4 +939,5 @@ app.listen(PORT, () => {
   console.log(`🔍 PubMed search: POST http://localhost:${PORT}/api/search-pubmed`);
   console.log(`🔬 Europe PMC search: POST http://localhost:${PORT}/api/search-europepmc`);
   console.log(`🤖 Claude generate: POST http://localhost:${PORT}/api/generate-response`);
+  console.log(`🧬 Deep research: POST http://localhost:${PORT}/api/deep-research`);
 });

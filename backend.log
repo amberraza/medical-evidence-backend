@@ -1,0 +1,106 @@
+🚀 Medical Evidence API server running on port 3001
+📍 Health check: http://localhost:3001/api/health
+🔍 PubMed search: POST http://localhost:3001/api/search-pubmed
+🔬 Europe PMC search: POST http://localhost:3001/api/search-europepmc
+🤖 Claude generate: POST http://localhost:3001/api/generate-response
+🧬 Deep research: POST http://localhost:3001/api/deep-research
+Original query: What are the latest treatments for type 2 diabetes? (length: 51 chars)
+Searching PubMed with filters: { dateRange: 'all', studyType: 'all' }
+Final search term: What are the latest treatments for type 2 diabetes?
+Searching Europe PMC with query: What are the latest treatments for type 2 diabetes?
+Final Europe PMC query: (What are the latest treatments for type 2 diabetes?)
+Found article IDs: [
+  '34131333', '37130947',
+  '38965663', '36965839',
+  '34518671', '37851036',
+  '34560536', '38632474',
+  '38060198', '36868730',
+  '32982969', '37686185',
+  '35080136', '36448672',
+  '29443421', '37708900',
+  '30938372', '39603746',
+  '39145614', '37230946'
+]
+Returning 20 articles
+Generating response for query: What are the latest treatments for type 2 diabetes?
+Conversation history length: 0
+Generated response successfully
+Response length: 2365 characters
+Extracted 3 follow-up questions
+Token usage - Input: 3803 Output: 533
+🔬 Deep research request: What are the common side effects of GLP-1 receptor agonists and SGLT-2 inhibitors?
+Original query: Management of hypertension in elderly patients (length: 46 chars)
+Searching PubMed with filters: { dateRange: 'all', studyType: 'all' }
+Final search term: Management of hypertension in elderly patients
+Searching Europe PMC with query: Management of hypertension in elderly patients
+Final Europe PMC query: (Management of hypertension in elderly patients)
+Found article IDs: [
+  '26066077', '24641225',
+  '22411292', '33369614',
+  '19851513', '28411897',
+  '23892774', '33856029',
+  '34587373', '11518836',
+  '38468407', '37170483',
+  '2680779',  '36792774',
+  '27809779', '27010951',
+  '34111189', '30606218',
+  '25786418', '14688489'
+]
+Returning 20 articles
+Generating response for query: Management of hypertension in elderly patients
+Conversation history length: 0
+Generated response successfully
+Response length: 2761 characters
+Extracted 3 follow-up questions
+Token usage - Input: 4000 Output: 527
+🔬 Deep research request: What are the most appropriate first-line antihypertensive medications for elderly patients?
+Original query: What are the latest treatments for type 2 diabetes? (length: 51 chars)
+Searching PubMed with filters: { dateRange: 'all', studyType: 'all' }
+Final search term: What are the latest treatments for type 2 diabetes?
+Searching Europe PMC with query: What are the latest treatments for type 2 diabetes?
+Final Europe PMC query: (What are the latest treatments for type 2 diabetes?)
+Found article IDs: [
+  '34131333', '37130947',
+  '38965663', '36965839',
+  '34518671', '37851036',
+  '34560536', '38632474',
+  '38060198', '36868730',
+  '32982969', '37686185',
+  '35080136', '36448672',
+  '29443421', '37708900',
+  '30938372', '39603746',
+  '39145614', '37230946'
+]
+Returning 20 articles
+Generating response for query: What are the latest treatments for type 2 diabetes?
+Conversation history length: 0
+Generated response successfully
+Response length: 2215 characters
+Extracted 3 follow-up questions
+Token usage - Input: 3803 Output: 486
+🔬 Deep research request: How do lifestyle modifications compare to medication in managing type 2 diabetes?
+Original query: What are the latest treatments for type 2 diabetes? (length: 51 chars)
+Searching PubMed with filters: { dateRange: 'all', studyType: 'all' }
+Final search term: What are the latest treatments for type 2 diabetes?
+Searching Europe PMC with query: What are the latest treatments for type 2 diabetes?
+Final Europe PMC query: (What are the latest treatments for type 2 diabetes?)
+Found article IDs: [
+  '34131333', '37130947',
+  '38965663', '36965839',
+  '34518671', '37851036',
+  '34560536', '38632474',
+  '38060198', '36868730',
+  '32982969', '37686185',
+  '35080136', '36448672',
+  '29443421', '37708900',
+  '30938372', '39603746',
+  '39145614', '37230946'
+]
+Returning 20 articles
+Generating response for query: What are the latest treatments for type 2 diabetes?
+Conversation history length: 0
+Generated response successfully
+Response length: 2170 characters
+Extracted 3 follow-up questions
+Token usage - Input: 3803 Output: 496
+🔬 Deep research request: What are the common side effects of GLP-1 receptor agonists, and who should avoid them?
