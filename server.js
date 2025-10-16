@@ -1247,6 +1247,263 @@ Return valid JSON array only, no additional text.`
   }
 });
 
+// Evidence Alerts Management Endpoints
+
+// In-memory storage for alerts (in production, use a database)
+let evidenceAlerts = [];
+
+// Create new alert
+app.post('/api/alerts', async (req, res) => {
+  try {
+    const { id, topic, email, frequency, createdAt, active } = req.body;
+
+    if (!topic || !email) {
+      return res.status(400).json({ error: 'Topic and email are required' });
+    }
+
+    const alert = {
+      id: id || Date.now().toString(),
+      topic,
+      email,
+      frequency: frequency || 'weekly',
+      createdAt: createdAt || new Date().toISOString(),
+      active: active !== undefined ? active : true,
+      lastChecked: null
+    };
+
+    evidenceAlerts.push(alert);
+
+    console.log(`🔔 Created alert: ${topic} for ${email}`);
+
+    res.json({
+      success: true,
+      alert,
+      message: 'Alert created successfully'
+    });
+
+  } catch (error) {
+    console.error('Create alert error:', error);
+    res.status(500).json({
+      error: 'Failed to create alert',
+      details: error.message
+    });
+  }
+});
+
+// Update alert
+app.put('/api/alerts/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+
+    const alertIndex = evidenceAlerts.findIndex(a => a.id === id);
+
+    if (alertIndex === -1) {
+      return res.status(404).json({ error: 'Alert not found' });
+    }
+
+    evidenceAlerts[alertIndex] = {
+      ...evidenceAlerts[alertIndex],
+      ...updates
+    };
+
+    console.log(`🔔 Updated alert: ${id}`);
+
+    res.json({
+      success: true,
+      alert: evidenceAlerts[alertIndex],
+      message: 'Alert updated successfully'
+    });
+
+  } catch (error) {
+    console.error('Update alert error:', error);
+    res.status(500).json({
+      error: 'Failed to update alert',
+      details: error.message
+    });
+  }
+});
+
+// Delete alert
+app.delete('/api/alerts/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const alertIndex = evidenceAlerts.findIndex(a => a.id === id);
+
+    if (alertIndex === -1) {
+      return res.status(404).json({ error: 'Alert not found' });
+    }
+
+    evidenceAlerts = evidenceAlerts.filter(a => a.id !== id);
+
+    console.log(`🔔 Deleted alert: ${id}`);
+
+    res.json({
+      success: true,
+      message: 'Alert deleted successfully'
+    });
+
+  } catch (error) {
+    console.error('Delete alert error:', error);
+    res.status(500).json({
+      error: 'Failed to delete alert',
+      details: error.message
+    });
+  }
+});
+
+// Check for new evidence for a specific alert
+app.post('/api/alerts/:id/check', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const alert = evidenceAlerts.find(a => a.id === id);
+
+    if (!alert) {
+      return res.status(404).json({ error: 'Alert not found' });
+    }
+
+    console.log(`🔍 Checking for new evidence: ${alert.topic}`);
+
+    // Calculate date range (since last check or past 7 days)
+    const lastCheckDate = alert.lastChecked
+      ? new Date(alert.lastChecked)
+      : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); // 7 days ago
+
+    const dateFilter = lastCheckDate.toISOString().split('T')[0].replace(/-/g, '/');
+
+    // Search PubMed for new articles
+    const pubmedResults = await performSearch(alert.topic, {
+      dateRange: 'custom',
+      startDate: dateFilter,
+      studyType: 'all'
+    });
+
+    // Update last checked time
+    const alertIndex = evidenceAlerts.findIndex(a => a.id === id);
+    if (alertIndex !== -1) {
+      evidenceAlerts[alertIndex].lastChecked = new Date().toISOString();
+    }
+
+    res.json({
+      success: true,
+      topic: alert.topic,
+      newArticles: pubmedResults.slice(0, 10), // Return top 10 new articles
+      count: pubmedResults.length,
+      checkedAt: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Check alert error:', error);
+    res.status(500).json({
+      error: 'Failed to check for new evidence',
+      details: error.message
+    });
+  }
+});
+
+// Get all alerts (for admin/debugging)
+app.get('/api/alerts', async (req, res) => {
+  try {
+    res.json({
+      alerts: evidenceAlerts,
+      count: evidenceAlerts.length
+    });
+  } catch (error) {
+    console.error('Get alerts error:', error);
+    res.status(500).json({
+      error: 'Failed to retrieve alerts',
+      details: error.message
+    });
+  }
+});
+
+// Visit Notes Generation endpoint
+app.post('/api/generate-visit-note', async (req, res) => {
+  try {
+    const { transcription } = req.body;
+
+    if (!transcription) {
+      return res.status(400).json({ error: 'Transcription is required' });
+    }
+
+    console.log(`📝 Generating visit note from transcription (${transcription.length} chars)`);
+
+    // Use Claude to generate structured SOAP note
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4096,
+      messages: [{
+        role: 'user',
+        content: `You are an experienced medical scribe. Convert the following clinical visit transcription into a structured SOAP note (Subjective, Objective, Assessment, Plan).
+
+Transcription:
+${transcription}
+
+Please generate a professional, well-formatted SOAP note with the following structure:
+
+# SOAP Note
+
+## Subjective
+- Chief Complaint
+- History of Present Illness
+- Review of Systems (if applicable)
+- Past Medical History (if mentioned)
+- Medications (if mentioned)
+- Allergies (if mentioned)
+- Social History (if mentioned)
+
+## Objective
+- Vital Signs (if mentioned)
+- Physical Examination Findings
+- Lab Results (if mentioned)
+- Imaging Results (if mentioned)
+
+## Assessment
+- Primary Diagnosis/Diagnoses with ICD codes if applicable
+- Differential Diagnoses (if applicable)
+
+## Plan
+- Diagnostic Tests Ordered
+- Treatments/Medications Prescribed
+- Patient Education
+- Follow-up Instructions
+- Referrals (if applicable)
+
+Guidelines:
+1. Use clear, professional medical terminology
+2. Be concise but comprehensive
+3. Only include information that was actually mentioned in the transcription
+4. If certain sections have no information, note "Not documented" or omit
+5. Use markdown formatting for readability
+6. Maintain patient privacy (don't include specific identifying information)
+
+Generate the SOAP note now:`
+      }]
+    });
+
+    const noteText = response.content[0].text;
+
+    res.json({
+      success: true,
+      note: noteText,
+      metadata: {
+        generatedAt: new Date().toISOString(),
+        wordCount: noteText.split(/\s+/).length,
+        transcriptionLength: transcription.length
+      }
+    });
+
+  } catch (error) {
+    console.error('Generate visit note error:', error);
+    res.status(500).json({
+      error: 'Failed to generate visit note',
+      details: error.message
+    });
+  }
+});
+
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Medical Evidence API server running on port ${PORT}`);
