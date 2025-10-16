@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const Anthropic = require('@anthropic-ai/sdk');
+const multer = require('multer');
+const { PDFParse } = require('pdf-parse');
 require('dotenv').config();
 
 const app = express();
@@ -10,6 +12,12 @@ const PORT = process.env.PORT || 3001;
 // Initialize Anthropic client
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
+});
+
+// Configure multer for file uploads
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
 });
 
 // Middleware
@@ -932,6 +940,313 @@ Format in clear markdown with headers.`;
   }
 });
 
+// Document Analysis endpoint
+app.post('/api/analyze-document', upload.single('document'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    console.log('📄 Document analysis request:', req.file.originalname);
+
+    // Extract text based on file type
+    let documentText = '';
+    if (req.file.mimetype === 'application/pdf') {
+      const parser = new PDFParse({ data: req.file.buffer });
+      const result = await parser.getText();
+      documentText = result.text;
+      await parser.destroy();
+    } else if (req.file.mimetype === 'text/plain') {
+      documentText = req.file.buffer.toString('utf-8');
+    } else {
+      return res.status(400).json({ error: 'Unsupported file type. Please upload PDF or TXT.' });
+    }
+
+    // Limit text length to avoid token limits (roughly 100k characters = ~25k tokens)
+    if (documentText.length > 100000) {
+      documentText = documentText.substring(0, 100000) + '\n\n[Document truncated due to length...]';
+    }
+
+    console.log(`Extracted ${documentText.length} characters from document`);
+
+    // Analyze document with Claude
+    const analysisResponse = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4096,
+      messages: [{
+        role: 'user',
+        content: `Analyze this medical research document and provide a comprehensive summary:
+
+DOCUMENT:
+${documentText}
+
+Provide analysis in the following format:
+
+# Document Summary
+
+## Title and Authors
+[Extract title and authors if available]
+
+## Research Type
+[Identify: Clinical Trial, Meta-Analysis, Case Study, Review, etc.]
+
+## Key Findings
+- [Main findings as bullet points]
+
+## Methods
+[Brief description of methodology]
+
+## Clinical Significance
+[Practical implications for clinical practice]
+
+## Limitations
+[Study limitations if mentioned]
+
+## Conclusions
+[Main conclusions from the authors]
+
+Format in clear markdown.`
+      }]
+    });
+
+    const analysis = analysisResponse.content[0].text;
+
+    res.json({
+      analysis,
+      documentLength: documentText.length,
+      fileName: req.file.originalname
+    });
+
+  } catch (error) {
+    console.error('Document analysis error:', error);
+    res.status(500).json({
+      error: 'Failed to analyze document',
+      details: error.message
+    });
+  }
+});
+
+// Find Similar Papers endpoint
+app.post('/api/find-similar', upload.single('document'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    console.log('🔍 Finding similar papers for:', req.file.originalname);
+
+    // Extract text
+    let documentText = '';
+    if (req.file.mimetype === 'application/pdf') {
+      const parser = new PDFParse({ data: req.file.buffer });
+      const result = await parser.getText();
+      documentText = result.text;
+      await parser.destroy();
+    } else if (req.file.mimetype === 'text/plain') {
+      documentText = req.file.buffer.toString('utf-8');
+    } else {
+      return res.status(400).json({ error: 'Unsupported file type' });
+    }
+
+    // Limit text for analysis
+    const textSample = documentText.substring(0, 50000);
+
+    // Use Claude to extract key concepts and generate search query
+    const queryResponse = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 500,
+      messages: [{
+        role: 'user',
+        content: `Extract the main medical topic and key concepts from this research document. Generate a concise PubMed search query (2-5 key terms) to find similar papers.
+
+DOCUMENT EXCERPT:
+${textSample}
+
+Respond with ONLY the search query terms, nothing else.`
+      }]
+    });
+
+    const searchQuery = queryResponse.content[0].text.trim();
+    console.log('Generated search query:', searchQuery);
+
+    // Search for similar papers
+    const similarPapers = await performSearch(searchQuery, { dateRange: 'all', studyType: 'all' });
+
+    res.json({
+      searchQuery,
+      papers: similarPapers.slice(0, 20),
+      totalFound: similarPapers.length
+    });
+
+  } catch (error) {
+    console.error('Find similar papers error:', error);
+    res.status(500).json({
+      error: 'Failed to find similar papers',
+      details: error.message
+    });
+  }
+});
+
+// Drug Information endpoint
+app.post('/api/drug-info', async (req, res) => {
+  try {
+    const { drugName } = req.body;
+
+    if (!drugName) {
+      return res.status(400).json({ error: 'Drug name is required' });
+    }
+
+    console.log(`📋 Fetching drug information for: ${drugName}`);
+
+    // Use Claude to generate comprehensive drug information
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4096,
+      messages: [{
+        role: 'user',
+        content: `As a medical information expert, provide comprehensive, evidence-based information about the medication "${drugName}".
+
+Structure your response as a JSON object with the following fields:
+- drugName: The medication name (as provided)
+- genericName: Generic name if different from drugName (or null)
+- brandNames: Array of common brand names (or empty array)
+- overview: Brief description of the medication (string)
+- indications: Array of FDA-approved indications
+- dosing: String describing typical adult dosing
+- sideEffects: Array of common side effects (>10% occurrence)
+- seriousSideEffects: Array of serious/severe side effects to watch for
+- contraindications: Array of absolute contraindications
+- interactions: Array of major drug interactions (5-10 most important)
+- monitoring: Array of monitoring parameters (labs, vitals, etc.)
+
+Important guidelines:
+1. Be accurate and evidence-based
+2. If the drug doesn't exist or you're not confident, return an error message in the overview field
+3. Use clear, professional medical terminology
+4. Focus on clinically relevant information
+5. Return valid JSON only, no additional text
+
+Respond with valid JSON only.`
+      }]
+    });
+
+    const content = response.content[0].text;
+
+    // Try to parse the JSON response
+    let drugInfo;
+    try {
+      // Clean the response - remove markdown code blocks if present
+      const cleanedContent = content
+        .replace(/```json\n?/g, '')
+        .replace(/```\n?/g, '')
+        .trim();
+
+      drugInfo = JSON.parse(cleanedContent);
+    } catch (parseError) {
+      console.error('Failed to parse Claude response as JSON:', parseError);
+      // If parsing fails, return a structured error response
+      return res.json({
+        drugName: drugName,
+        overview: content,
+        indications: [],
+        sideEffects: [],
+        interactions: []
+      });
+    }
+
+    res.json(drugInfo);
+
+  } catch (error) {
+    console.error('Drug info error:', error);
+    res.status(500).json({
+      error: 'Failed to fetch drug information',
+      details: error.message
+    });
+  }
+});
+
+// Clinical Guidelines Search endpoint
+app.post('/api/search-guidelines', async (req, res) => {
+  try {
+    const { query, organization } = req.body;
+
+    if (!query) {
+      return res.status(400).json({ error: 'Query is required' });
+    }
+
+    console.log(`📚 Searching guidelines for: ${query} (Organization: ${organization || 'all'})`);
+
+    // Use Claude to search and compile relevant clinical guidelines
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4096,
+      messages: [{
+        role: 'user',
+        content: `As a medical librarian and clinical guideline expert, search for relevant clinical practice guidelines about "${query}"${organization && organization !== 'all' ? ` specifically from ${organization}` : ''}.
+
+Return a JSON array of guideline objects with the following structure:
+[
+  {
+    "title": "Full guideline title",
+    "organization": "Issuing organization (e.g., ACC/AHA, ADA, CHEST)",
+    "year": "Year published or updated (YYYY)",
+    "specialty": "Medical specialty",
+    "summary": "Brief 2-3 sentence overview of the guideline",
+    "keyRecommendations": ["Array of 3-5 key recommendations"],
+    "url": "Official URL to the guideline (use real URLs when possible)"
+  }
+]
+
+Important guidelines:
+1. Focus on major, authoritative clinical practice guidelines from recognized organizations
+2. Prioritize recent guidelines (last 5 years when possible)
+3. Include 5-8 most relevant guidelines
+4. Use real, accurate URLs when available
+5. Be specific with recommendations
+6. If no relevant guidelines exist, return an empty array
+7. Common organizations: ACC/AHA, ADA, CHEST, IDSA, NCCN, ACOG, AAN, ESC, WHO, CDC, NICE, ASCO
+
+Return valid JSON array only, no additional text.`
+      }]
+    });
+
+    const content = response.content[0].text;
+
+    // Parse the JSON response
+    let guidelines;
+    try {
+      const cleanedContent = content
+        .replace(/```json\n?/g, '')
+        .replace(/```\n?/g, '')
+        .trim();
+
+      guidelines = JSON.parse(cleanedContent);
+
+      // Ensure it's an array
+      if (!Array.isArray(guidelines)) {
+        guidelines = [];
+      }
+    } catch (parseError) {
+      console.error('Failed to parse guidelines response as JSON:', parseError);
+      guidelines = [];
+    }
+
+    res.json({
+      query,
+      organization: organization || 'all',
+      guidelines,
+      count: guidelines.length
+    });
+
+  } catch (error) {
+    console.error('Guidelines search error:', error);
+    res.status(500).json({
+      error: 'Failed to search guidelines',
+      details: error.message
+    });
+  }
+});
+
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Medical Evidence API server running on port ${PORT}`);
@@ -940,4 +1255,6 @@ app.listen(PORT, () => {
   console.log(`🔬 Europe PMC search: POST http://localhost:${PORT}/api/search-europepmc`);
   console.log(`🤖 Claude generate: POST http://localhost:${PORT}/api/generate-response`);
   console.log(`🧬 Deep research: POST http://localhost:${PORT}/api/deep-research`);
+  console.log(`📄 Document analysis: POST http://localhost:${PORT}/api/analyze-document`);
+  console.log(`🔎 Find similar: POST http://localhost:${PORT}/api/find-similar`);
 });

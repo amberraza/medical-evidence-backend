@@ -104,3 +104,33 @@ Response length: 2170 characters
 Extracted 3 follow-up questions
 Token usage - Input: 3803 Output: 496
 🔬 Deep research request: What are the common side effects of GLP-1 receptor agonists, and who should avoid them?
+🔬 Deep research request: What are the side effects and contraindications of GLP-1 receptor agonists?
+🔬 Deep research request: What are the latest treatments for type 2 diabetes?
+Original query: What are the latest treatments for type 2 diabetes? (length: 51 chars)
+Searching PubMed with filters: { dateRange: 'all', studyType: 'all' }
+Final search term: What are the latest treatments for type 2 diabetes?
+Searching Europe PMC with query: What are the latest treatments for type 2 diabetes?
+Final Europe PMC query: (What are the latest treatments for type 2 diabetes?)
+Found article IDs: [
+  '34131333', '37130947',
+  '38965663', '36965839',
+  '34518671', '37851036',
+  '34560536', '38632474',
+  '38060198', '36868730',
+  '32982969', '37686185',
+  '35080136', '36448672',
+  '29443421', '37708900',
+  '30938372', '39603746',
+  '39145614', '37230946'
+]
+Returning 20 articles
+Generating response for query: What are the latest treatments for type 2 diabetes?
+Conversation history length: 0
+Generated response successfully
+Response length: 2475 characters
+Extracted 3 follow-up questions
+Token usage - Input: 3803 Output: 528
+🔬 Deep research request: What are the latest treatments for type 2 diabetes?
+🔬 Deep research request: Management of hypertension in elderly patients
+Retry attempt 1/3 after 1000ms delay
+🔬 Deep research request: What are the latest treatments for type 2 diabetes?
