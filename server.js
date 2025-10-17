@@ -1504,6 +1504,149 @@ Generate the SOAP note now:`
   }
 });
 
+// Query Enhancement Endpoints
+
+// Preprocess query to extract medical entities
+app.post('/api/preprocess-query', async (req, res) => {
+  try {
+    const { query } = req.body;
+
+    if (!query) {
+      return res.status(400).json({ error: 'Query is required' });
+    }
+
+    console.log('Preprocessing query:', query);
+
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 500,
+      temperature: 0,
+      messages: [{
+        role: 'user',
+        content: `You are a medical search query optimizer. Extract the key medical concepts from this query and rewrite it as a concise medical literature search query.
+
+Original query: "${query}"
+
+Respond with ONLY the optimized search query, nothing else. Remove:
+- Multiple choice options (A, B, C, D, E)
+- Patient demographics unless critical to the medical question
+- Non-medical context words
+- Question words (what, which, how) unless they change medical meaning
+
+Focus on:
+- Medical conditions/diagnoses
+- Treatments/interventions
+- Diagnostic tests
+- Clinical outcomes
+- Key symptoms
+
+Examples:
+Input: "65-year-old man with anterior STEMI, BP 90/60. What is best treatment? A) Beta-blocker B) PCI C) Nitro"
+Output: "anterior STEMI hypotension treatment primary PCI reperfusion"
+
+Input: "What is the best medication for high blood pressure in diabetic patients?"
+Output: "hypertension diabetes antihypertensive therapy ACE inhibitors"
+
+Input: "My patient has a fever and productive cough with rust-colored sputum"
+Output: "community acquired pneumonia rust colored sputum streptococcus pneumoniae"
+
+Now process this query:`
+      }]
+    });
+
+    const optimizedQuery = response.content[0].text.trim();
+
+    console.log('Optimized query:', optimizedQuery);
+
+    res.json({
+      originalQuery: query,
+      optimizedQuery: optimizedQuery
+    });
+
+  } catch (error) {
+    console.error('Error preprocessing query:', error.message);
+    res.status(500).json({
+      error: 'Failed to preprocess query',
+      details: error.message
+    });
+  }
+});
+
+// Generate query suggestions when no results found
+app.post('/api/query-suggestions', async (req, res) => {
+  try {
+    const { query } = req.body;
+
+    if (!query) {
+      return res.status(400).json({ error: 'Query is required' });
+    }
+
+    console.log('Generating query suggestions for:', query);
+
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      temperature: 0.3,
+      messages: [{
+        role: 'user',
+        content: `The user's medical literature search returned no results for this query:
+"${query}"
+
+Generate 3 alternative search queries that are more likely to find relevant medical literature. Each query should:
+1. Use standard medical terminology (not lay terms)
+2. Focus on clinical aspects (diagnosis, treatment, pathophysiology, outcomes)
+3. Be concise and specific
+4. Remove exam-style formatting if present
+5. Use terms commonly found in medical journal article titles
+
+Respond with ONLY valid JSON, no markdown formatting:
+{
+  "suggestions": [
+    {"query": "...", "reason": "..."},
+    {"query": "...", "reason": "..."},
+    {"query": "...", "reason": "..."}
+  ]
+}
+
+Example:
+Input query: "65yo man STEMI choose A B C D E"
+Response:
+{
+  "suggestions": [
+    {
+      "query": "STEMI treatment primary PCI versus thrombolysis",
+      "reason": "Focuses on the main treatment decision in STEMI management"
+    },
+    {
+      "query": "acute myocardial infarction reperfusion therapy guidelines",
+      "reason": "Uses formal terminology and searches for clinical guidelines"
+    },
+    {
+      "query": "ST elevation myocardial infarction emergency management",
+      "reason": "Searches for emergency treatment protocols"
+    }
+  ]
+}`
+      }]
+    });
+
+    const content = response.content[0].text.trim();
+    const cleanedContent = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    const suggestions = JSON.parse(cleanedContent);
+
+    console.log('Generated suggestions:', suggestions);
+
+    res.json(suggestions);
+
+  } catch (error) {
+    console.error('Error generating query suggestions:', error.message);
+    res.status(500).json({
+      error: 'Failed to generate query suggestions',
+      details: error.message
+    });
+  }
+});
+
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Medical Evidence API server running on port ${PORT}`);
