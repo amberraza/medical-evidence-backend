@@ -6,10 +6,13 @@ const multer = require('multer');
 const { PDFParse } = require('pdf-parse');
 require('dotenv').config();
 
-// Import new services
+// Import services
 const cacheService = require('./services/cache.service');
 const crossrefService = require('./services/crossref.service');
 const unpaywallService = require('./services/unpaywall.service');
+const openalexService = require('./services/openalex.service');
+const clinicaltrialsService = require('./services/clinicaltrials.service');
+const smartRoutingService = require('./services/smart-routing.service');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -94,8 +97,8 @@ app.post('/api/search-pubmed', async (req, res) => {
 
     // Try cache first
     const cachedResults = await cacheService.cacheSearch(query, filters, async () => {
-      // If cache miss, perform the search below
-      return await performPubMedSearch(query, filters);
+      // If cache miss, perform multi-source search with smart routing
+      return await performSearch(query, filters);
     });
 
     return res.json({ articles: cachedResults });
@@ -788,116 +791,171 @@ function buildEuropePMCQuery(query, filters) {
   return searchQuery + filterParams;
 }
 
-// Helper function to perform multi-source search
+// Helper function to perform multi-source search with smart routing
 async function performSearch(query, filters) {
+  // Use smart routing to determine which sources to query
+  const routingPlan = smartRoutingService.route(query);
   const searchPromises = [];
 
-  // Search PubMed
-  searchPromises.push(
-    (async () => {
-      try {
-        const pubmedQuery = buildPubMedQuery(query, filters);
-        const searchResponse = await retryWithBackoff(() =>
-          axios.get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi', {
-            params: {
-              db: 'pubmed',
-              term: pubmedQuery,
-              retmax: 20,
-              retmode: 'json',
-              sort: 'relevance'
-            }
-          })
-        );
+  // Execute searches based on routing plan
+  for (const execution of routingPlan.execution) {
+    const { source, limit } = execution;
 
-        const ids = searchResponse.data.esearchresult.idlist;
-        if (ids.length === 0) return [];
+    if (source === 'pubmed') {
+      searchPromises.push(
+        (async () => {
+          try {
+            const pubmedQuery = buildPubMedQuery(query, filters);
+            const searchResponse = await retryWithBackoff(() =>
+              axios.get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi', {
+                params: {
+                  db: 'pubmed',
+                  term: pubmedQuery,
+                  retmax: limit || 20,
+                  retmode: 'json',
+                  sort: 'relevance',
+                  api_key: process.env.NCBI_API_KEY
+                }
+              })
+            );
 
-        const summaryResponse = await retryWithBackoff(() =>
-          axios.get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi', {
-            params: {
-              db: 'pubmed',
-              id: ids.join(','),
-              retmode: 'json'
-            }
-          })
-        );
+            const ids = searchResponse.data.esearchresult.idlist;
+            if (ids.length === 0) return [];
 
-        return Object.values(summaryResponse.data.result).filter(item => item.uid).map(article => ({
-          pmid: article.uid,
-          title: article.title || 'No title',
-          authors: article.authors?.map(a => a.name).join(', ') || 'Unknown',
-          journal: article.fulljournalname || article.source || 'Unknown',
-          year: article.pubdate?.split(' ')[0] || 'Unknown',
-          doi: article.elocationid || null,
-          abstract: null,
-          source: 'PubMed',
-          url: `https://pubmed.ncbi.nlm.nih.gov/${article.uid}/`
-        }));
-      } catch (err) {
-        console.warn('PubMed search failed:', err.message);
-        return [];
-      }
-    })()
-  );
+            const summaryResponse = await retryWithBackoff(() =>
+              axios.get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi', {
+                params: {
+                  db: 'pubmed',
+                  id: ids.join(','),
+                  retmode: 'json',
+                  api_key: process.env.NCBI_API_KEY
+                }
+              })
+            );
 
-  // Search Europe PMC
-  searchPromises.push(
-    (async () => {
-      try {
-        const europePmcQuery = buildEuropePMCQuery(query, filters);
-        const response = await retryWithBackoff(() =>
-          axios.get('https://www.ebi.ac.uk/europepmc/webservices/rest/search', {
-            params: {
-              query: europePmcQuery,
-              format: 'json',
-              pageSize: 20,
-              resultType: 'core',
-              sort: 'relevance'
-            }
-          })
-        );
-
-        return (response.data.resultList?.result || []).map(article => {
-          // Build URL based on available identifiers
-          let url = '';
-          if (article.pmid) {
-            url = `https://pubmed.ncbi.nlm.nih.gov/${article.pmid}/`;
-          } else if (article.pmcid) {
-            url = `https://europepmc.org/article/PMC/${article.pmcid.replace('PMC', '')}`;
-          } else if (article.doi) {
-            url = `https://doi.org/${article.doi}`;
+            return Object.values(summaryResponse.data.result).filter(item => item.uid).map(article => ({
+              pmid: article.uid,
+              title: article.title || 'No title',
+              authors: article.authors?.map(a => a.name).join(', ') || 'Unknown',
+              journal: article.fulljournalname || article.source || 'Unknown',
+              year: article.pubdate?.split(' ')[0] || 'Unknown',
+              doi: article.elocationid || null,
+              abstract: null,
+              source: 'PubMed',
+              url: `https://pubmed.ncbi.nlm.nih.gov/${article.uid}/`
+            }));
+          } catch (err) {
+            console.warn('PubMed search failed:', err.message);
+            return [];
           }
+        })()
+      );
+    }
 
-          return {
-            pmid: article.pmid || null,
-            title: article.title || 'No title',
-            authors: article.authorString || 'Unknown',
-            journal: article.journalTitle || 'Unknown',
-            year: article.pubYear || 'Unknown',
-            doi: article.doi || null,
-            abstract: article.abstractText || null,
-            source: 'Europe PMC',
-            url: url
-          };
-        });
-      } catch (err) {
-        console.warn('Europe PMC search failed:', err.message);
-        return [];
-      }
-    })()
-  );
+    if (source === 'europepmc') {
+      searchPromises.push(
+        (async () => {
+          try {
+            const europePmcQuery = buildEuropePMCQuery(query, filters);
+            const response = await retryWithBackoff(() =>
+              axios.get('https://www.ebi.ac.uk/europepmc/webservices/rest/search', {
+                params: {
+                  query: europePmcQuery,
+                  format: 'json',
+                  pageSize: limit || 20,
+                  resultType: 'core',
+                  sort: 'relevance'
+                }
+              })
+            );
+
+            return (response.data.resultList?.result || []).map(article => {
+              // Build URL based on available identifiers
+              let url = '';
+              if (article.pmid) {
+                url = `https://pubmed.ncbi.nlm.nih.gov/${article.pmid}/`;
+              } else if (article.pmcid) {
+                url = `https://europepmc.org/article/PMC/${article.pmcid.replace('PMC', '')}`;
+              } else if (article.doi) {
+                url = `https://doi.org/${article.doi}`;
+              }
+
+              return {
+                pmid: article.pmid || null,
+                title: article.title || 'No title',
+                authors: article.authorString || 'Unknown',
+                journal: article.journalTitle || 'Unknown',
+                year: article.pubYear || 'Unknown',
+                doi: article.doi || null,
+                abstract: article.abstractText || null,
+                source: 'Europe PMC',
+                url: url
+              };
+            });
+          } catch (err) {
+            console.warn('Europe PMC search failed:', err.message);
+            return [];
+          }
+        })()
+      );
+    }
+
+    if (source === 'openalex') {
+      searchPromises.push(
+        (async () => {
+          try {
+            console.log(`Searching OpenAlex with limit ${limit}...`);
+            const articles = await openalexService.searchWorks(query, {
+              limit: limit || 20,
+              medicalOnly: execution.medicalOnly
+            });
+            console.log(`OpenAlex returned ${articles.length} articles`);
+            return articles;
+          } catch (err) {
+            console.warn('OpenAlex search failed:', err.message);
+            return [];
+          }
+        })()
+      );
+    }
+
+    if (source === 'clinicaltrials') {
+      searchPromises.push(
+        (async () => {
+          try {
+            console.log(`Searching ClinicalTrials.gov with limit ${limit}...`);
+            const trials = await clinicaltrialsService.searchTrials(query, {
+              limit: limit || 15
+            });
+            console.log(`ClinicalTrials.gov returned ${trials.length} trials`);
+            return trials;
+          } catch (err) {
+            console.warn('ClinicalTrials.gov search failed:', err.message);
+            return [];
+          }
+        })()
+      );
+    }
+  }
 
   const results = await Promise.all(searchPromises);
   const allArticles = results.flat();
 
-  // Deduplicate by PMID or title
+  console.log(`Total articles from all sources: ${allArticles.length}`);
+
+  // Deduplicate by PMID, NCT ID, DOI, or title
   const seen = new Set();
-  return allArticles.filter(article => {
-    const key = article.pmid || article.title.toLowerCase();
+  const deduplicated = allArticles.filter(article => {
+    // Create unique key based on available identifiers
+    const key = article.nctId || article.pmid || article.doi || article.title.toLowerCase();
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
+
+  console.log(`After deduplication: ${deduplicated.length} articles`);
+
+  return deduplicated;
 }
 
 // Deep Research endpoint
