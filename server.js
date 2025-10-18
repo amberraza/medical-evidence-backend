@@ -27,7 +27,9 @@ const upload = multer({
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+// Increase JSON payload limit to handle enriched articles with citations, PDFs, funding, etc.
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 // Retry utility with exponential backoff
 const retryWithBackoff = async (fn, maxRetries = 3, initialDelay = 1000) => {
@@ -535,20 +537,30 @@ app.post('/api/generate-response', async (req, res) => {
     console.log('Conversation history length:', conversationHistory?.length || 0);
 
     // Format articles for the prompt - include abstracts for better context
-    const articlesContext = articles.map((a, i) => {
+    // Limit to top 15 articles to avoid 413 Payload Too Large errors
+    const articlesToSend = articles.slice(0, 15);
+
+    const articlesContext = articlesToSend.map((a, i) => {
       let context = `[${i + 1}] ${a.title}\n   Authors: ${a.authors}\n   Journal: ${a.journal}, ${a.pubdate}\n   PMID: ${a.pmid}`;
       if (a.studyType) {
         context += `\n   Study Type: ${a.studyType}`;
       }
+      // Add citation count if available (from CrossRef enrichment)
+      if (a.citationCount && a.citationCount > 0) {
+        context += `\n   Citations: ${a.citationCount}`;
+      }
       if (a.abstract) {
-        // Include abstract for context but truncate if too long
-        const abstractPreview = a.abstract.length > 500
-          ? a.abstract.substring(0, 500) + '...'
+        // Truncate abstracts more aggressively to avoid payload issues
+        const abstractPreview = a.abstract.length > 400
+          ? a.abstract.substring(0, 400) + '...'
           : a.abstract;
         context += `\n   Abstract: ${abstractPreview}`;
       }
       return context;
     }).join('\n\n');
+
+    console.log(`Sending ${articlesToSend.length} articles to Claude (truncated from ${articles.length})`);
+    console.log(`Total context length: ${articlesContext.length} characters`);
 
     // Build system prompt
     const systemPrompt = `You are a medical information assistant that provides evidence-based answers. You help users explore medical topics through conversation, maintaining context from previous exchanges.
@@ -572,9 +584,19 @@ IMPORTANT:
     // Build messages array with conversation history
     const messages = [];
 
-    // Add previous conversation if exists
+    // Add previous conversation if exists, but limit to last 10 exchanges (20 messages)
+    // to avoid payload size issues
     if (conversationHistory && conversationHistory.length > 0) {
-      conversationHistory.forEach(msg => {
+      const maxHistoryMessages = 20;
+      const historyToInclude = conversationHistory.length > maxHistoryMessages
+        ? conversationHistory.slice(-maxHistoryMessages)
+        : conversationHistory;
+
+      if (conversationHistory.length > maxHistoryMessages) {
+        console.log(`Limiting conversation history from ${conversationHistory.length} to ${maxHistoryMessages} messages`);
+      }
+
+      historyToInclude.forEach(msg => {
         messages.push({
           role: msg.role === 'user' ? 'user' : 'assistant',
           content: msg.content
@@ -808,7 +830,8 @@ async function performSearch(query, filters) {
           year: article.pubdate?.split(' ')[0] || 'Unknown',
           doi: article.elocationid || null,
           abstract: null,
-          source: 'PubMed'
+          source: 'PubMed',
+          url: `https://pubmed.ncbi.nlm.nih.gov/${article.uid}/`
         }));
       } catch (err) {
         console.warn('PubMed search failed:', err.message);
@@ -834,16 +857,29 @@ async function performSearch(query, filters) {
           })
         );
 
-        return (response.data.resultList?.result || []).map(article => ({
-          pmid: article.pmid || null,
-          title: article.title || 'No title',
-          authors: article.authorString || 'Unknown',
-          journal: article.journalTitle || 'Unknown',
-          year: article.pubYear || 'Unknown',
-          doi: article.doi || null,
-          abstract: article.abstractText || null,
-          source: 'Europe PMC'
-        }));
+        return (response.data.resultList?.result || []).map(article => {
+          // Build URL based on available identifiers
+          let url = '';
+          if (article.pmid) {
+            url = `https://pubmed.ncbi.nlm.nih.gov/${article.pmid}/`;
+          } else if (article.pmcid) {
+            url = `https://europepmc.org/article/PMC/${article.pmcid.replace('PMC', '')}`;
+          } else if (article.doi) {
+            url = `https://doi.org/${article.doi}`;
+          }
+
+          return {
+            pmid: article.pmid || null,
+            title: article.title || 'No title',
+            authors: article.authorString || 'Unknown',
+            journal: article.journalTitle || 'Unknown',
+            year: article.pubYear || 'Unknown',
+            doi: article.doi || null,
+            abstract: article.abstractText || null,
+            source: 'Europe PMC',
+            url: url
+          };
+        });
       } catch (err) {
         console.warn('Europe PMC search failed:', err.message);
         return [];
@@ -876,7 +912,7 @@ app.post('/api/deep-research', async (req, res) => {
     console.log('🔬 Deep research request:', query);
 
     // Stage 1: Initial search
-    const initialArticles = await performSearch(query, filters);
+    let initialArticles = await performSearch(query, filters);
 
     if (initialArticles.length === 0) {
       return res.status(404).json({
@@ -884,6 +920,11 @@ app.post('/api/deep-research', async (req, res) => {
         retryable: true
       });
     }
+
+    // Enrich initial articles with CrossRef and Unpaywall metadata
+    console.log('Enriching initial articles with CrossRef and Unpaywall...');
+    initialArticles = await crossrefService.enrichArticles(initialArticles);
+    initialArticles = await unpaywallService.checkMultipleArticles(initialArticles);
 
     // Stage 2: Analyze results and generate follow-up questions
     const analysisPrompt = `You are a medical research expert. Analyze these research findings and:
@@ -921,7 +962,10 @@ Example format: ["question 1", "question 2", "question 3"]`;
     // Stage 3: Search for each follow-up question
     const followUpResults = [];
     for (const fq of followUpQuestions.slice(0, 5)) {
-      const articles = await performSearch(fq, filters);
+      let articles = await performSearch(fq, filters);
+      // Enrich follow-up articles too
+      articles = await crossrefService.enrichArticles(articles);
+      articles = await unpaywallService.checkMultipleArticles(articles);
       followUpResults.push({
         question: fq,
         articles: articles.slice(0, 5)
@@ -945,6 +989,8 @@ Provide a detailed synthesis covering:
 3. Evidence Quality (strength of research)
 4. Knowledge Gaps (what's still unknown)
 5. Recommendations (evidence-based guidance)
+
+IMPORTANT: Do NOT include a "Sources" section or reference list at the end. Sources will be displayed separately in the UI.
 
 Format in clear markdown with headers.`;
 
