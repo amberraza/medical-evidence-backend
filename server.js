@@ -6,6 +6,11 @@ const multer = require('multer');
 const { PDFParse } = require('pdf-parse');
 require('dotenv').config();
 
+// Import new services
+const cacheService = require('./services/cache.service');
+const crossrefService = require('./services/crossref.service');
+const unpaywallService = require('./services/unpaywall.service');
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -60,6 +65,22 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Medical Evidence API is running' });
 });
 
+// Cache statistics endpoint
+app.get('/api/cache/stats', (req, res) => {
+  const stats = cacheService.getStats();
+  res.json({
+    status: 'ok',
+    cache: stats,
+    message: `Cache is ${stats.enabled ? 'enabled' : 'disabled'} with ${stats.hitRate} hit rate`
+  });
+});
+
+// Clear cache endpoint (for testing/debugging)
+app.post('/api/cache/clear', (req, res) => {
+  cacheService.clear();
+  res.json({ status: 'ok', message: 'Cache cleared successfully' });
+});
+
 // Search PubMed endpoint
 app.post('/api/search-pubmed', async (req, res) => {
   try {
@@ -68,6 +89,44 @@ app.post('/api/search-pubmed', async (req, res) => {
     if (!query) {
       return res.status(400).json({ error: 'Query parameter is required' });
     }
+
+    // Try cache first
+    const cachedResults = await cacheService.cacheSearch(query, filters, async () => {
+      // If cache miss, perform the search below
+      return await performPubMedSearch(query, filters);
+    });
+
+    return res.json({ articles: cachedResults });
+
+  } catch (error) {
+    console.error('PubMed search error:', error.message);
+    let statusCode = 500;
+    let errorMessage = 'Failed to search PubMed';
+    let retryable = true;
+
+    if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+      errorMessage = 'PubMed request timed out. Please try again.';
+      retryable = true;
+    } else if (error.response?.status === 429) {
+      errorMessage = 'Too many requests. Please wait a moment and try again.';
+      statusCode = 429;
+      retryable = true;
+    } else if (error.response?.status >= 400 && error.response?.status < 500) {
+      errorMessage = 'Invalid search query. Please try a different search.';
+      statusCode = error.response.status;
+      retryable = false;
+    }
+
+    res.status(statusCode).json({
+      error: errorMessage,
+      retryable: retryable
+    });
+  }
+});
+
+// Extracted search function for caching
+async function performPubMedSearch(query, filters) {
+  try {
 
     console.log('Original query:', query, '(length:', query.length, 'chars)');
 
@@ -129,7 +188,8 @@ app.post('/api/search-pubmed', async (req, res) => {
       term: searchTerm,
       retmax: 20,
       retmode: 'json',
-      sort: 'relevance'
+      sort: 'relevance',
+      api_key: process.env.NCBI_API_KEY // Increases rate limit from 3 to 10 req/sec
     };
 
     const searchResponse = await retryWithBackoff(
@@ -150,7 +210,8 @@ app.post('/api/search-pubmed', async (req, res) => {
     const summaryParams = {
       db: 'pubmed',
       id: ids.join(','),
-      retmode: 'json'
+      retmode: 'json',
+      api_key: process.env.NCBI_API_KEY
     };
 
     const summaryResponse = await retryWithBackoff(
@@ -166,7 +227,8 @@ app.post('/api/search-pubmed', async (req, res) => {
       db: 'pubmed',
       id: ids.join(','),
       retmode: 'xml',
-      rettype: 'abstract'
+      rettype: 'abstract',
+      api_key: process.env.NCBI_API_KEY
     };
 
     let abstractsMap = {};
@@ -190,12 +252,16 @@ app.post('/api/search-pubmed', async (req, res) => {
           let textMatch;
 
           while ((textMatch = abstractTextRegex.exec(match[1])) !== null) {
-            // Remove any remaining XML tags and clean up
+            // Remove any remaining XML tags and decode ALL HTML entities
             const cleanText = textMatch[1]
               .replace(/<[^>]+>/g, '')
               .replace(/&lt;/g, '<')
               .replace(/&gt;/g, '>')
               .replace(/&amp;/g, '&')
+              .replace(/&quot;/g, '"')
+              .replace(/&apos;/g, "'")
+              .replace(/&#(\d+);/g, (match, dec) => String.fromCharCode(dec)) // Numeric entities
+              .replace(/&#x([0-9a-f]+);/gi, (match, hex) => String.fromCharCode(parseInt(hex, 16))) // Hex entities
               .trim();
             if (cleanText) {
               abstractParts.push(cleanText);
@@ -272,45 +338,19 @@ app.post('/api/search-pubmed', async (req, res) => {
 
     console.log('Returning', articles.length, 'articles');
 
-    res.json({ articles });
+    // Step 4: Enrich articles with CrossRef metadata and Unpaywall full-text links
+    console.log('Enriching articles with CrossRef and Unpaywall...');
+    let enrichedArticles = await crossrefService.enrichArticles(articles);
+    enrichedArticles = await unpaywallService.checkMultipleArticles(enrichedArticles);
+
+    console.log('Final enriched articles count:', enrichedArticles.length);
+    return enrichedArticles;
 
   } catch (error) {
     console.error('PubMed search error:', error.message);
-
-    // Determine error type and provide helpful message
-    let statusCode = 500;
-    let errorMessage = 'Failed to search PubMed';
-    let retryable = true;
-
-    if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
-      errorMessage = 'PubMed request timed out. Please try again.';
-      statusCode = 504;
-    } else if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
-      errorMessage = 'Unable to connect to PubMed. Please check your internet connection.';
-      statusCode = 503;
-    } else if (error.response?.status === 429) {
-      errorMessage = 'PubMed rate limit exceeded. Please wait a moment and try again.';
-      statusCode = 429;
-    } else if (error.response?.status >= 500) {
-      errorMessage = 'PubMed service is temporarily unavailable. Please try again later.';
-      statusCode = 503;
-    } else if (error.response?.status === 414) {
-      errorMessage = 'Search query is too long. Please use a shorter question.';
-      statusCode = 400;
-      retryable = false;
-    } else if (error.response?.status >= 400 && error.response?.status < 500) {
-      errorMessage = 'Invalid search query. Please check your search terms.';
-      statusCode = 400;
-      retryable = false;
-    }
-
-    res.status(statusCode).json({
-      error: errorMessage,
-      details: error.message,
-      retryable: retryable
-    });
+    throw error; // Re-throw to be caught by outer try-catch
   }
-});
+}
 
 // Search Europe PMC endpoint
 app.post('/api/search-europepmc', async (req, res) => {
